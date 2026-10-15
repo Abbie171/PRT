@@ -3680,6 +3680,15 @@ function prfRender(){
   const {active,inactive}=_prSplitActive(funds);
   const money=v=>'₹'+Math.round(v||0).toLocaleString('en-IN');
   const pct=v=>(v==null||v==='')?'—':(v*100).toFixed(1)+'%';
+  // Same 5-year rule as the Excel build: highlight whichever weight column is
+  // the meaningful one for this portfolio's holding period.
+  const _allClub=_prClubFunds(active).concat(_prClubFunds(inactive));
+  const _tPV=_allClub.reduce((s,f)=>s+(+f.pv||0),0);
+  const _tDW=_allClub.reduce((s,f)=>s+((+f.days||0)*(+f.pv||0)),0);
+  const _overallYrs=_tPV>0 ? (_tDW/_tPV)/365 : 0;
+  const _hiStyle=' style="background:#FFF2A8;font-weight:700"';
+  const _hiCW=_overallYrs>5 ? _hiStyle : '';
+  const _hiPW=_overallYrs>5 ? '' : _hiStyle;
   const grandPV=funds.reduce((s,f)=>s+(+f.pv||0),0);
   const grandCV=funds.reduce((s,f)=>s+(+f.cv||0),0);
   const grandPost=funds.reduce((s,f)=>s+(+f.cv||0)+_prChange(f),0);
@@ -3698,8 +3707,9 @@ function prfRender(){
         <td class="n">${money(pv)}</td><td class="n">${money(cv)}</td><td class="n">${money(cv-pv)}</td>
         <td class="n">${yrs.toFixed(2)}</td><td class="n">${pct(pv?(cv-pv)/pv:0)}</td>
         <td class="n">${pct((pv>0&&yrs>0)?Math.pow(cv/pv,1/yrs)-1:0)}</td>
-        <td class="n">${pct(rv.down52)}</td><td class="n">${pct(grandPV?pv/grandPV:0)}</td>
-        <td class="n">${pct(grandCV?cv/grandCV:0)}</td>
+        <td class="n">${pct(rv.down52)}</td>
+        <td class="n"${_hiPW}>${pct(grandPV?pv/grandPV:0)}</td>
+        <td class="n"${_hiCW}>${pct(grandCV?cv/grandCV:0)}</td>
         <td class="n">${chg?money(chg):'—'}</td><td class="n">${money(post)}</td>
         <td class="n">${pct(grandPost?post/grandPost:0)}</td>
         <td class="n">—</td><td class="n">${pct(rv.reval)}</td><td class="n">—</td></tr>`;
@@ -3737,7 +3747,10 @@ function prfRender(){
     // Fetched, but nothing recognised — almost always a header-name change.
     rdMsg='<span style="color:var(--gold)">⚠ Live valuation sheet loaded but 0 funds parsed — check the “Product Name” / “Reval / Deval( Normalized)” headers still match.</span>';
   if(meta) meta.innerHTML=`<b>${esc(S.investorName||'Client')}</b> — ${funds.length} holding(s): `
-    +`${active.length} active, ${inactive.length} inactive.<br>`+srcMsg+'<br>'+rdMsg;
+    +`${active.length} active, ${inactive.length} inactive.<br>`
+    +`<span style="color:var(--text2)">Overall holding period <b>${_overallYrs.toFixed(2)} yrs</b> — `
+    +`highlighting <b style="background:#FFF2A8;padding:0 4px">${_overallYrs>5?'Current Wts':'Purchase Wts'}</b> `
+    +`(${_overallYrs>5?'over':'under'} 5 years).</span><br>`+srcMsg+'<br>'+rdMsg;
 }
 
 // Download just this worksheet (single tab) — independent of the ticket export.
@@ -4069,6 +4082,19 @@ function normHdr(h){return(h||'').toString().trim().replace(/\s+/g,' ').toUpperC
 // (5 letters · 4 digits · 1 letter) so a stray column can't poison the export.
 const PAN_HEADERS=['PAN','PAN NO','PAN NO.','PAN NUMBER','PAN AS IN FOLIO',
                    'INVESTOR PAN','PAN OF INVESTOR','PAN NO OF INVESTOR'];
+
+// Statements head the holding-period column differently depending on which
+// report produced them — "HOLDING DAYS" in older files, "AVG HOLDING DAYS" in
+// newer ones. A miss here silently yields 0, which zeroes CAGR too.
+const DAYS_HEADERS=['HOLDING DAYS','AVG HOLDING DAYS','AVERAGE HOLDING DAYS',
+                    'AVG. HOLDING DAYS','HOLDING PERIOD','HOLDING DAYS (AVG)'];
+function pickNum(nr, names){
+  for(let i=0;i<names.length;i++){
+    const v=parseFloat(String(nr[names[i]]==null?'':nr[names[i]]).replace(/,/g,''));
+    if(!isNaN(v)) return v;
+  }
+  return 0;
+}
 const PAN_RE=/^[A-Z]{5}[0-9]{4}[A-Z]$/;
 function pickPan(nr){
   for(let i=0;i<PAN_HEADERS.length;i++){
@@ -4214,7 +4240,7 @@ function processExcel(file){
             cnav:    parseFloat(nr['CURRENT NAV'])||0,
             cv:      parseFloat(nr['CURRENT VALUE'])||0,
             gain:    parseFloat(nr['GAIN'])||0,
-            days:    parseFloat(nr['HOLDING DAYS'])||0,
+            days:    pickNum(nr, DAYS_HEADERS),
             abs:     parseFloat(nr['ABSOLUTE RETURN (%)'])||0,
             cagr:    parseFloat(nr['CAGR (%)'])||0,
             comments:String(nr['COMMENTS']||'').trim(),
@@ -4258,7 +4284,7 @@ function processExcel(file){
               units:parseFloat(nr['BALANCE UNITS'])||0,pnav:parseFloat(nr['PURCHASE NAV'])||0,
               pv:parseFloat(nr['PURCHASE VALUE'])||0,cnav:parseFloat(nr['CURRENT NAV'])||0,
               cv:parseFloat(nr['CURRENT VALUE'])||0,gain:parseFloat(nr['GAIN'])||0,
-              days:parseFloat(nr['HOLDING DAYS'])||0,abs:parseFloat(nr['ABSOLUTE RETURN (%)'])||0,
+              days:pickNum(nr, DAYS_HEADERS),abs:parseFloat(nr['ABSOLUTE RETURN (%)'])||0,
               cagr:parseFloat(nr['CAGR (%)'])||0,comments:String(nr['COMMENTS']||'').trim()};
           }).filter(r=>r.scheme);
 
@@ -9550,7 +9576,10 @@ function _prClubFunds(list){
     const key=(typeof _rdNorm==='function' ? _rdNorm(f.sn||'') : '') || String(f.sn||'').toLowerCase().trim();
     if(!key) return;
     // S.funds (built by readPFTable) names these `hp` and `cat`, NOT days/category.
-    const days=(f.hp!=null?+f.hp:+f.days)||0;
+    // `f.hp != null` was true for a ZERO holding period, so a 0 never fell
+    // through to the alternative fields. Take the first value that is actually
+    // non-zero instead.
+    const days=(+f.hp||0) || (+f.days||0) || (+f.holdingDays||0) || 0;
     // Category from the Equity Deployments sheet wins over the statement's own.
     const cat = f._eqCat || f.cat || f.category || '';
     if(!map.has(key)){ map.set(key,{sn:f.sn||'',category:cat,folios:[],pv:0,cv:0,daysW:0,chg:0,n:0}); order.push(key); }
@@ -9779,9 +9808,23 @@ function _buildRestructureFormatSheet(){
     return meta.sections[meta.sections.length-1];
   };
 
-  const secA = addSection('Active Funds', _prClubFunds(active));
+  // Which weight column matters depends on how long the portfolio has been
+  // held: past 5 years the current value is the meaningful base, below that the
+  // purchase value is. Highlight whichever one applies so it's read first.
+  // Decided here rather than by Excel conditional formatting — this SheetJS
+  // build doesn't emit that — and holding period doesn't move when the
+  // Restructure column is edited, so a fixed highlight stays correct.
+  const clubA=_prClubFunds(active), clubI=_prClubFunds(inactive);
+  const allClub=clubA.concat(clubI);
+  const totPV   = allClub.reduce((s,f)=>s+(+f.pv||0),0);
+  const totDayW = allClub.reduce((s,f)=>s+((+f.days||0)*(+f.pv||0)),0);
+  const overallYears = totPV>0 ? (totDayW/totPV)/365 : 0;
+  const COL_PWT=11, COL_CWT=12;                       // L = Purchase Wts, M = Current Wts
+  const HILITE = overallYears > 5 ? COL_CWT : COL_PWT;
+
+  const secA = addSection('Active Funds', clubA);
   rows.push(blank());
-  const secI = addSection('In Active Funds', _prClubFunds(inactive));
+  const secI = addSection('In Active Funds', clubI);
   rows.push(blank());
   const grandRow = blank(); grandRow[1]='Total'; rows.push(grandRow);
   const G = rows.length;                               // grand-total Excel row
@@ -9897,9 +9940,16 @@ function _buildRestructureFormatSheet(){
     return o;
   };
   meta.data.forEach(r=>{ for(let c=0;c<NC;c++) set(c,r,{s:mk(c===1?DATA_L:DATA,c)}); });
+  // Yellow over the weight column that applies, on the data rows and on the
+  // grand-total figure for it.
+  const YELLOW={fgColor:{rgb:'FFF2A8'}};
+  meta.data.forEach(r=>{
+    set(HILITE,r,{s:Object.assign(mk(DATA,HILITE),{fill:YELLOW})});
+  });
   [[secA,SEC_A,TOT_A],[secI,SEC_I,TOT_I]].forEach(([s,secStyle,totStyle])=>{
     const hdrRow=s.first-1, secRow=s.first-2;
     for(let c=0;c<NC;c++){
+      // Headers all keep the standard band — only the data cells are yellow.
       set(c,hdrRow,{s:Object.assign({},HDR)});   // headers are text — no numFmt
       set(c,s.totalAt,{s:mk(totStyle,c)});
     }
