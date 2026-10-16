@@ -3712,7 +3712,7 @@ function prfRender(){
         <td class="n"${_hiCW}>${pct(grandCV?cv/grandCV:0)}</td>
         <td class="n">${chg?money(chg):'—'}</td><td class="n">${money(post)}</td>
         <td class="n">${pct(grandPost?post/grandPost:0)}</td>
-        <td class="n">—</td><td class="n">${pct(rv.reval)}</td><td class="n">—</td></tr>`;
+        <td class="n">${pct(rv.earnings)}</td><td class="n">${pct(rv.reval)}</td><td class="n">${pct(rv.expRet)}</td></tr>`;
     });
     html+=`<tr style="font-weight:700;background:var(--surf)">
       <td></td><td class="L">Total</td><td></td><td></td>
@@ -6698,7 +6698,13 @@ const REVAL_DEVAL_HEADERS = {
   revalDeval: ['Reval / Deval( Normalized)','Reval / Deval'],
   expRet:     ['Expected Returns (5 years)'],
   down52:     ['Down from 52 week high'],    // fills the worksheet's own 52-week column
+  earnings:   ['Revenue Growth (Q1FY27)'],   // latest quarter → the Earnings column
 };
+// The quarterly header is renamed every quarter (Q1FY27 → Q2FY27 → …). Match the
+// current name first, then any "Revenue Growth (Q…)" column, so a rename degrades
+// to the right column instead of silently blanking Earnings. The 6-Yr Normalized
+// column is explicitly NOT matched.
+const EARNINGS_QTR_RE = /^revenue\s*growth\s*\(\s*q\d/i;
 // Single source of truth for parsing the Reval/Deval sheet — used by both the
 // Restructure-tab cell lookup AND the Database-tab Active/Inactive tables.
 // Walks rows in order, tracking the current section via "Active Funds" /
@@ -6710,7 +6716,7 @@ function _parseRevalDevalSheet(){
   if(!_revalDevalCache || !_revalDevalCache.rows || !_revalDevalCache.rows.length) return null;
   const rows = _revalDevalCache.rows;
   let section = 'active'; // default before we see any section title
-  let idxSn = -1, idxRd = -1, idxXr = -1, idxD52 = -1;
+  let idxSn = -1, idxRd = -1, idxXr = -1, idxD52 = -1, idxEarn = -1;
   const active = [], inactive = [];
 
   rows.forEach(r => {
@@ -6752,6 +6758,10 @@ function _parseRevalDevalSheet(){
             ? d52All.reduce((a,b)=> Math.abs(b-idxRd) < Math.abs(a-idxRd) ? b : a)
             : d52All[d52All.length-1])
         : -1;
+      // Earnings: the current quarter's name, else any quarterly revenue-growth
+      // column, so the yearly rename can't blank it without warning.
+      idxEarn = tryIdx(REVAL_DEVAL_HEADERS.earnings);
+      if(idxEarn < 0) idxEarn = cells.findIndex(c => EARNINGS_QTR_RE.test(c));
       return;
     }
     if(idxSn < 0) return; // haven't seen the header yet
@@ -6761,13 +6771,14 @@ function _parseRevalDevalSheet(){
     const rd = idxRd >= 0 ? (cells[idxRd] || '') : '';
     const xr = idxXr >= 0 ? (cells[idxXr] || '') : '';
     const d52= idxD52>= 0 ? (cells[idxD52]|| '') : '';
+    const earn=idxEarn>=0 ? (cells[idxEarn]||'') : '';
 
     // Skip sub-category title rows (e.g. "Small Cap Index"): no value in either
     // metric column and column-A serial blank.
     const hasSerial = /^\d+/.test(cells[0] || '');
     if(!hasSerial && !rd && !xr) return;
 
-    const entry = { sn, rd, xr, d52 };
+    const entry = { sn, rd, xr, d52, earn };
     if(section === 'inactive') inactive.push(entry); else active.push(entry);
   });
 
@@ -6815,7 +6826,7 @@ function _revalDevalLookup(fund){
     const sc=_rdScore(target, e.sn);
     if(sc>bestScore){ bestScore=sc; best=e; }
   }
-  if(best && bestScore>=50) return { revalDeval: best.rd, expRet: best.xr, down52: best.d52 };
+  if(best && bestScore>=50) return { revalDeval: best.rd, expRet: best.xr, down52: best.d52, earnings: best.earn };
   return null;
 }
 function _revalDevalCell(fund){
@@ -9731,7 +9742,8 @@ function _prRevalFor(f){
   const num = s=>{ const v=parseFloat(String(s==null?'':s).replace(/[^\d.\-]/g,'')); return isNaN(v)?null:v/100; };
   return { reval:  hit?num(hit.revalDeval):null,
            expRet: hit?num(hit.expRet):null,
-           down52: hit?num(hit.down52):null };
+           down52: hit?num(hit.down52):null,
+           earnings: hit?num(hit.earnings):null };
 }
 
 // The template's first tab, reproduced verbatim — same wording, same order,
@@ -9795,9 +9807,11 @@ function _buildRestructureFormatSheet(){
       r[11]=0;                                         // Purchase Wts  (formula)
       r[12]=0;                                         // Current Wts   (formula)
       r[13]=chg; r[14]=cv+chg; r[15]=0;
-      r[16]='';                                        // Earnings — manual input
+      r[16]=rv.earnings==null?'':rv.earnings;          // latest quarter's revenue growth
       r[17]=rv.reval==null?'':rv.reval;
-      r[18]='';
+      // Expected Return comes straight from the sheet's "Expected Returns
+      // (5 years)" column rather than being derived from Earnings/Revaluation.
+      r[18]=rv.expRet==null?'':rv.expRet;
       rows.push(r);
       meta.data.push(rows.length);                     // Excel row number
     });
@@ -9863,9 +9877,8 @@ function _buildRestructureFormatSheet(){
     set(12,r,{f:`IF($F$${G}=0,0,F${r}/$F$${G})`});             // Current Wts
     set(14,r,{f:`N${r}+F${r}`});                               // Post Restructure
     set(15,r,{f:`IF($O$${G}=0,0,O${r}/$O$${G})`});             // Post Wts
-    // N() coerces an empty manual cell to 0, so a blank Earnings or Revaluation
-    // can never turn this into #VALUE!.
-    set(18,r,{f:`N(Q${r})+(N(R${r})/5)`});                     // Expected Return
+    // Expected Return is no longer derived — it is the sheet's own 5-year
+    // figure, written as a value above. No formula here.
   });
 
   // ── Section totals ──
