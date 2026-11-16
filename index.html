@@ -2229,6 +2229,14 @@ window.addEventListener('message',function(ev){
       <div style="color:var(--text3);font-size:12px;margin-top:4px">Same file you use for Restructure. Nothing needs to be changed — the worksheet is built straight from the holdings.</div>
     </div>
     <input type="file" id="prfXlsxInput" accept=".xlsx,.xls" style="display:none" onchange="prfFileSelect(event)">
+    <!-- Second file: the transaction report, which drives the per-year return
+         columns. Optional — without it those columns simply stay blank. -->
+    <div class="upload-zone" id="prfTxnZone" onclick="prfTxnImport()" ondragover="prfTxnDragOver(event)" ondragleave="prfTxnDragLeave()" ondrop="prfTxnDrop(event)" style="margin-bottom:14px;padding:14px">
+      <div style="font-size:20px;margin-bottom:4px">🧾</div>
+      <div style="font-weight:600;font-size:13px">Drop the <b>transaction report</b> here (optional)</div>
+      <div style="color:var(--text3);font-size:11.5px;margin-top:3px">The one with TRANSACTION TYPE and PURCHASE DATE. Fills the per-year return columns with this client's own figures. Liquid funds are skipped.</div>
+    </div>
+    <input type="file" id="prfTxnInput" accept=".xlsx,.xls" style="display:none" onchange="prfTxnFile(event)">
     <div id="prfMeta" style="font-size:12.5px;color:var(--text2);margin-bottom:10px"></div>
     <div class="tbl-wrap" style="overflow:auto"><table id="prfTable" style="font-size:12px"></table></div>
   </div>
@@ -3630,6 +3638,128 @@ async function _prLoadSources(){
     try{ await refreshRevalDevalFromGoogleSheet(false); }catch(e){}
   }
 }
+// ═══════════════════════════════════════
+//  TRANSACTION REPORT — per-client returns by year of purchase
+//  The holdings export gives one lifetime Absolute Return per fund. The
+//  transaction report breaks each fund into the tranches that built it, each
+//  with its own purchase date, so we can answer "what did the money he put in
+//  during 2023 actually do". Entirely client-specific — nothing from the
+//  research sheets.
+//
+//  Layout (sheet "1. Mutual Fund"):
+//     rows 1-3   title / client / RM
+//     row  4     TRANSACTION TYPE · PURCHASE DATE · … · ABSOLUTE RETURN (%) · CAGR (%)
+//     row  5     investor
+//     row  6     category                      e.g. "Equity: Focused"
+//     row  7     fund name  "Name [folio ]"
+//     row  8     "Avg. Purchase NAV: …"        skipped
+//     rows 9+    one row per tranche
+//     then       "<fund> Total", blank, next fund
+// ═══════════════════════════════════════
+const TXN_LIQUID_RE = /liquid|overnight|ultra\s*short|money\s*market|arbitrage/i;
+
+// Last five COMPLETE calendar years, newest first. The current year is still
+// running, so its returns aren't comparable with full-year figures.
+function _prYearWindow(){
+  const y = new Date().getFullYear() - 1;
+  return [0,1,2,3,4].map(i => y - i);
+}
+
+function _parseTxnWorkbook(wb){
+  // The report numbers its tabs ("1. Mutual Fund"), so match loosely.
+  const name = wb.SheetNames.find(n => /mutual\s*fund/i.test(n)) || wb.SheetNames[0];
+  const grid = XLSX.utils.sheet_to_json(wb.Sheets[name], {header:1, defval:'', raw:false});
+  const funds = new Map();
+  let cat = '', fund = null;
+
+  grid.forEach(row => {
+    const A = String((row||[])[0]||'').trim();
+    const B = String((row||[])[1]||'').trim();
+    if(!A && !B) return;
+
+    // "Fund Name [folio ]" starts a new fund block
+    const m = A.match(/^(.*?)\s*\[\s*([^\]]*?)\s*\]\s*$/);
+    if(m){
+      const sn = m[1].trim();
+      if(!funds.has(sn)) funds.set(sn, {sn, folio:m[2].trim(), cat, byYear:{}, total:{pv:0,gain:0,daysW:0}});
+      fund = funds.get(sn);
+      return;
+    }
+    if(/^Avg\. Purchase NAV/i.test(A)) return;      // info line
+    if(/\sTotal$/i.test(A)) { fund = null; return; } // end of block
+    if(!B && A && !/^\d/.test(A)){ cat = A; return; } // category / investor heading
+
+    // Tranche rows carry a dd/mm/yyyy purchase date in column B
+    if(fund && /^\d{2}\/\d{2}\/\d{4}$/.test(B)){
+      const yr   = +B.slice(6,10);
+      const pv   = parseFloat(String(row[4]||'').replace(/,/g,'')) || 0;
+      const gain = parseFloat(String(row[8]||'').replace(/,/g,'')) || 0;
+      const days = parseFloat(String(row[9]||'').replace(/,/g,'')) || 0;
+      if(!fund.byYear[yr]) fund.byYear[yr] = {pv:0, gain:0, daysW:0, n:0};
+      const b = fund.byYear[yr];
+      // Merge tranches by summing money, never by averaging percentages.
+      b.pv += pv; b.gain += gain; b.daysW += days*pv; b.n++;
+      fund.total.pv += pv; fund.total.gain += gain; fund.total.daysW += days*pv;
+    }
+  });
+
+  // Derive the merged absolute return and CAGR for each year bucket.
+  const out = {};
+  funds.forEach(f => {
+    if(TXN_LIQUID_RE.test(f.sn) || TXN_LIQUID_RE.test(f.cat)) return;   // liquid excluded
+    const years = {};
+    Object.keys(f.byYear).forEach(y => {
+      const b = f.byYear[y];
+      if(b.pv <= 0) return;
+      const abs  = b.gain / b.pv;
+      const yrs  = (b.daysW / b.pv) / 365;
+      const cagr = yrs > 0 ? Math.pow((b.pv + b.gain) / b.pv, 1/yrs) - 1 : null;
+      years[y] = {abs, cagr, pv:b.pv, gain:b.gain, tranches:b.n};
+    });
+    out[f.sn] = {sn:f.sn, folio:f.folio, cat:f.cat, years,
+                 totalAbs: f.total.pv>0 ? f.total.gain/f.total.pv : null};
+  });
+  return out;
+}
+
+// Match a worksheet fund to a transaction-report fund, reusing the fund-name
+// matcher used everywhere else.
+function _txnFor(sn){
+  const t = S.txnReturns;
+  if(!t || !sn) return null;
+  if(t[sn]) return t[sn];
+  let best=null, score=0;
+  Object.keys(t).forEach(k=>{ const s=_rdScore(sn,k); if(s>score){score=s; best=t[k];} });
+  return score>=50 ? best : null;
+}
+
+function prfTxnImport(){ const i=document.getElementById('prfTxnInput'); if(i){ i.value=''; i.click(); } }
+function prfTxnFile(e){ const f=e.target.files[0]; if(f) _prfReadTxn(f); }
+function prfTxnDragOver(e){ e.preventDefault(); const z=document.getElementById('prfTxnZone'); if(z) z.classList.add('drag-over'); }
+function prfTxnDragLeave(){ const z=document.getElementById('prfTxnZone'); if(z) z.classList.remove('drag-over'); }
+function prfTxnDrop(e){ e.preventDefault(); const z=document.getElementById('prfTxnZone'); if(z) z.classList.remove('drag-over');
+  const f=e.dataTransfer.files[0]; if(f) _prfReadTxn(f); }
+
+function _prfReadTxn(file){
+  if(typeof XLSX==='undefined'){ showNotif('SheetJS not loaded.','warn'); return; }
+  const rd=new FileReader();
+  rd.onload=ev=>{
+    try{
+      const wb=XLSX.read(new Uint8Array(ev.target.result),{type:'array'});
+      const parsed=_parseTxnWorkbook(wb);
+      const n=Object.keys(parsed).length;
+      if(!n){ showNotif('⚠ No tranche rows found — is this the transaction report (with PURCHASE DATE)?','warn'); return; }
+      S.txnReturns=parsed;
+      const yrs=new Set(); Object.values(parsed).forEach(f=>Object.keys(f.years).forEach(y=>yrs.add(+y)));
+      showNotif(`✓ Transactions loaded — ${n} fund(s), purchase years ${Math.min(...yrs)}–${Math.max(...yrs)}.`,'success');
+      prfRender();
+    }catch(err){
+      showNotif('⚠ Could not read the transaction file — '+(err.message||err),'warn');
+    }
+  };
+  rd.readAsArrayBuffer(file);
+}
+
 function prfImportExcel(){ const i=document.getElementById('prfXlsxInput'); if(i){ i.value=''; i.click(); } }
 function prfFileSelect(e){ const f=e.target.files[0]; if(f){ _prfStages=[]; _prfStage('picked file: '+f.name); S._prfImportPending=true; processExcel(f); } }
 function prfDragOver(e){ e.preventDefault(); const z=document.getElementById('prfUploadZone'); if(z) z.classList.add('drag-over'); }
@@ -3693,9 +3823,11 @@ function prfRender(){
   const grandCV=funds.reduce((s,f)=>s+(+f.cv||0),0);
   const grandPost=funds.reduce((s,f)=>s+(+f.cv||0)+_prChange(f),0);
   let html='';
-  const head='<tr>'+PR_HEADERS.map(h=>`<th style="white-space:normal;font-size:11px">${esc(h.replace(/\n/g,' '))}</th>`).join('')+'</tr>';
+  const _yrs=_prYearWindow();
+  const _allHdrs=PR_HEADERS.concat(_yrs.map(String)).concat(['> 5 Years']);
+  const head='<tr>'+_allHdrs.map(h=>`<th style="white-space:normal;font-size:11px">${esc(h.replace(/\n/g,' '))}</th>`).join('')+'</tr>';
   const section=(title,list)=>{
-    html+=`<tr><td colspan="${PR_HEADERS.length}" style="font-weight:700;color:var(--gold);padding-top:12px">${esc(title)}</td></tr>`;
+    html+=`<tr><td colspan="${_allHdrs.length}" style="font-weight:700;color:var(--gold);padding-top:12px">${esc(title)}</td></tr>`;
     html+=head;
     let tPV=0,tCV=0,tPost=0;
     list.forEach((f,i)=>{
@@ -3712,13 +3844,17 @@ function prfRender(){
         <td class="n"${_hiCW}>${pct(grandCV?cv/grandCV:0)}</td>
         <td class="n">${chg?money(chg):'—'}</td><td class="n">${money(post)}</td>
         <td class="n">${pct(grandPost?post/grandPost:0)}</td>
-        <td class="n">${pct(rv.earnings)}</td><td class="n">${pct(rv.reval)}</td><td class="n">${pct(rv.expRet)}</td></tr>`;
+        <td class="n">${pct(rv.earnings)}</td><td class="n">${pct(rv.reval)}</td><td class="n">${pct(rv.expRet)}</td>${(()=>{const tx=_txnFor(f.sn);
+          let opv=0,og=0; if(tx&&tx.years) Object.keys(tx.years).forEach(y=>{ if(+y<_yrs[_yrs.length-1]){opv+=tx.years[y].pv;og+=tx.years[y].gain;} });
+          return _yrs.map(y=>{const b=tx&&tx.years?tx.years[y]:null;
+            return `<td class="n">${b&&b.abs!=null?pct(b.abs):'—'}</td>`;}).join("")
+            +`<td class="n">${opv>0?pct(og/opv):'—'}</td>`;})()}</tr>`;
     });
     html+=`<tr style="font-weight:700;background:var(--surf)">
       <td></td><td class="L">Total</td><td></td><td></td>
       <td class="n">${money(tPV)}</td><td class="n">${money(tCV)}</td><td class="n">${money(tCV-tPV)}</td>
       <td></td><td class="n">${pct(tPV?(tCV-tPV)/tPV:0)}</td><td></td><td></td><td></td><td></td><td></td>
-      <td class="n">${money(tPost)}</td><td></td><td></td><td></td><td></td></tr>`;
+      <td class="n">${money(tPost)}</td><td></td><td></td><td></td><td></td>${_yrs.map(()=>"<td></td>").join("")}<td></td></tr>`;
   };
   section('Active Funds',_prClubFunds(active));
   section('In Active Funds',_prClubFunds(inactive));
@@ -6699,12 +6835,15 @@ const REVAL_DEVAL_HEADERS = {
   expRet:     ['Expected Returns (5 years)'],
   down52:     ['Down from 52 week high'],    // fills the worksheet's own 52-week column
   earnings:   ['Revenue Growth (Q1FY27)'],   // latest quarter → the Earnings column
+  fiveYr:     ['5yr','5 yr','5yr CAGR','5 Year','5 Years'],  // → the "> 5 Years" column
 };
 // The quarterly header is renamed every quarter (Q1FY27 → Q2FY27 → …). Match the
 // current name first, then any "Revenue Growth (Q…)" column, so a rename degrades
 // to the right column instead of silently blanking Earnings. The 6-Yr Normalized
 // column is explicitly NOT matched.
 const EARNINGS_QTR_RE = /^revenue\s*growth\s*\(\s*q\d/i;
+// How many calendar years of returns to carry into the worksheet, newest first.
+const PR_YEAR_COUNT = 5;
 // Single source of truth for parsing the Reval/Deval sheet — used by both the
 // Restructure-tab cell lookup AND the Database-tab Active/Inactive tables.
 // Walks rows in order, tracking the current section via "Active Funds" /
@@ -6716,7 +6855,10 @@ function _parseRevalDevalSheet(){
   if(!_revalDevalCache || !_revalDevalCache.rows || !_revalDevalCache.rows.length) return null;
   const rows = _revalDevalCache.rows;
   let section = 'active'; // default before we see any section title
-  let idxSn = -1, idxRd = -1, idxXr = -1, idxD52 = -1, idxEarn = -1;
+  let idxSn = -1, idxRd = -1, idxXr = -1, idxD52 = -1, idxEarn = -1, idx5y = -1;
+  // Calendar-year return columns, newest first. Detected by header shape rather
+  // than hard-coded, so when the desk adds a new year it appears automatically.
+  let yearCols = [];
   const active = [], inactive = [];
 
   rows.forEach(r => {
@@ -6762,6 +6904,11 @@ function _parseRevalDevalSheet(){
       // column, so the yearly rename can't blank it without warning.
       idxEarn = tryIdx(REVAL_DEVAL_HEADERS.earnings);
       if(idxEarn < 0) idxEarn = cells.findIndex(c => EARNINGS_QTR_RE.test(c));
+      yearCols = cells.map((c,i)=> /^(19|20)\d{2}$/.test(c) ? {year:+c, idx:i} : null)
+                      .filter(Boolean)
+                      .sort((a,b)=> b.year - a.year)
+                      .slice(0, PR_YEAR_COUNT);
+      idx5y = tryIdx(REVAL_DEVAL_HEADERS.fiveYr);
       return;
     }
     if(idxSn < 0) return; // haven't seen the header yet
@@ -6778,11 +6925,20 @@ function _parseRevalDevalSheet(){
     const hasSerial = /^\d+/.test(cells[0] || '');
     if(!hasSerial && !rd && !xr) return;
 
-    const entry = { sn, rd, xr, d52, earn };
+    // Yearly returns aligned to the detected year columns, newest first.
+    const yrsVals = yearCols.map(y => cells[y.idx] || '');
+    const fy = idx5y >= 0 ? (cells[idx5y] || '') : '';
+    const entry = { sn, rd, xr, d52, earn, yrs: yrsVals, fy };
     if(section === 'inactive') inactive.push(entry); else active.push(entry);
   });
 
-  return { active, inactive };
+  return { active, inactive, years: yearCols.map(y=>y.year) };
+}
+// The calendar years the sheet currently carries, newest first — drives both
+// the worksheet's extra column headers and the values beneath them.
+function _prYears(){
+  const p = (typeof _parseRevalDevalSheet==='function') ? _parseRevalDevalSheet() : null;
+  return (p && p.years) ? p.years : [];
 }
 
 // Normalize a scheme name for fuzzy matching: lowercase, expand cap-style words,
@@ -6826,7 +6982,8 @@ function _revalDevalLookup(fund){
     const sc=_rdScore(target, e.sn);
     if(sc>bestScore){ bestScore=sc; best=e; }
   }
-  if(best && bestScore>=50) return { revalDeval: best.rd, expRet: best.xr, down52: best.d52, earnings: best.earn };
+  if(best && bestScore>=50) return { revalDeval: best.rd, expRet: best.xr, down52: best.d52,
+                                     earnings: best.earn, yrs: best.yrs || [], fiveYr: best.fy };
   return null;
 }
 function _revalDevalCell(fund){
@@ -9743,7 +9900,11 @@ function _prRevalFor(f){
   return { reval:  hit?num(hit.revalDeval):null,
            expRet: hit?num(hit.expRet):null,
            down52: hit?num(hit.down52):null,
-           earnings: hit?num(hit.earnings):null };
+           earnings: hit?num(hit.earnings):null,
+           // One entry per year the sheet carries; "-" / blank → null, not 0,
+           // so a fund that didn't exist that year shows empty rather than flat.
+           years: hit ? (hit.yrs||[]).map(num) : [],
+           fiveYr: hit ? num(hit.fiveYr) : null };   // "NA" → null, shown blank
 }
 
 // The template's first tab, reproduced verbatim — same wording, same order,
@@ -9774,7 +9935,15 @@ function _buildRestructureFormatSheet(){
   if(!funds.length) return null;
   const { active, inactive } = _prSplitActive(funds);
 
-  const NC = PR_HEADERS.length;                       // 18 → A..R
+  // Calendar-year return columns are appended AFTER Expected Return, so every
+  // existing formula's column letter stays put.
+  // Five complete calendar years, then everything purchased before them. The
+  // figures are THIS client's — the return on the money he put in that year —
+  // taken from the transaction report, not the research sheet.
+  const YEARS = _prYearWindow();
+  const HDRS  = PR_HEADERS.concat(YEARS.map(String)).concat(['> 5 Years']);
+  const NYR   = YEARS.length;
+  const NC = HDRS.length;                       // 18 → A..R
   // '' (a real, empty text cell) rather than null. A null leaves NO cell, and a
   // cell that doesn't exist cannot carry the band fill or the grid borders —
   // that's what made the Total rows look patchy. The only formula that reads a
@@ -9790,7 +9959,7 @@ function _buildRestructureFormatSheet(){
   // Lay out one section; returns {first,last,totalRow} as 1-based Excel rows.
   const addSection = (title, list)=>{
     const tRow = blank(); tRow[0]=title; rows.push(tRow);
-    rows.push(PR_HEADERS.slice());
+    rows.push(HDRS.slice());
     const first = rows.length+1;                       // Excel row of first data row
     // `list` is already clubbed: one entry per fund, chg pre-summed.
     list.forEach((f,i)=>{
@@ -9812,6 +9981,19 @@ function _buildRestructureFormatSheet(){
       // Expected Return comes straight from the sheet's "Expected Returns
       // (5 years)" column rather than being derived from Earnings/Revaluation.
       r[18]=rv.expRet==null?'':rv.expRet;
+      // Calendar-year returns, newest first, after Expected Return.
+      // Per-year returns for this client's own tranches, merged per year.
+      const tx = _txnFor(f.sn);
+      YEARS.forEach((y,k)=>{
+        const b = tx && tx.years ? tx.years[y] : null;
+        r[19+k] = (b && b.abs!=null) ? b.abs : '';
+      });
+      // "> 5 Years": everything bought before the earliest column, merged.
+      let opv=0, ogain=0;
+      if(tx && tx.years) Object.keys(tx.years).forEach(y=>{
+        if(+y < YEARS[YEARS.length-1]){ opv += tx.years[y].pv; ogain += tx.years[y].gain; }
+      });
+      r[19+NYR] = opv>0 ? ogain/opv : '';
       rows.push(r);
       meta.data.push(rows.length);                     // Excel row number
     });
@@ -9864,7 +10046,9 @@ function _buildRestructureFormatSheet(){
   //            A    B    C    D    E     F     G     H   I   J   K   L   M
   const COLFMT=[null,null,null,null,MONEY,MONEY,MONEY,YRS,PCT,PCT,PCT,PCT,PCT,
   //            N     O     P   Q   R   S
-                MONEY,MONEY,PCT,PCT,PCT,PCT];
+                MONEY,MONEY,PCT,PCT,PCT,PCT]
+                // T onward: one percent column per calendar year
+                .concat(YEARS.map(()=>PCT)).concat([PCT]);
 
   // ── Per-row formulas, mirroring the template exactly ──
   meta.data.forEach(r=>{
@@ -9917,6 +10101,7 @@ function _buildRestructureFormatSheet(){
   // column empty, but we fill it and "Hybrid: Equity Savings" needs the room.
   const D=8.88671875;
   ws['!cols']=[13.109375,40.77734375,22,14,12.33203125,12.33203125,12,D,D,D,12,12,12,D,14.5546875,D,D,D,D]
+    .concat(YEARS.map(()=>9)).concat([11])          // one narrow column per calendar year
     .map(w=>({wch:w}));
   ws['!sheetViews']=[{showGridLines:false}];   // template hides gridlines
   // Colours taken from the template: theme accent1 (4472C4) darkened 50% for the
